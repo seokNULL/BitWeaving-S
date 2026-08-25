@@ -1,4 +1,13 @@
-bitweaving:bitweaving.cpp SIMD_operations.h
-	g++ -mavx2 bitweaving.cpp SIMD_operations.h -o bitweaving -g 
+CXX      ?= g++
+CXXFLAGS ?= -mavx2 -O2 -g
+TARGET    = bitweaving
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): bitweaving.cpp SIMD_operations.h
+	$(CXX) $(CXXFLAGS) bitweaving.cpp -o $(TARGET)
+
 clean:
-	rm simd
+	rm -f $(TARGET)
