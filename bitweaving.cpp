@@ -67,13 +67,11 @@
 
 using namespace std;
 
-#define MAX_ROWS 8000000
-
 //int C_length = 128; //number of data in the database
 int C_length = 2000000; //number of data in the database
 int B = 32;  // length of each data
-int C[32][MAX_ROWS];
-uint32_t V[MAX_ROWS]; // original values, kept for result verification
+int *C[32];  // one bit-plane per bit, allocated at runtime for C_length rows
+uint32_t *V; // original values, kept for result verification
 
 // Supported comparison predicates
 enum Predicate { PRED_LT, PRED_LE, PRED_GT, PRED_GE, PRED_EQ, PRED_NEQ, PRED_BETWEEN };
@@ -113,8 +111,9 @@ static double wall_time()
 static void usage(const char *prog)
 {
   printf("Usage: %s [options]\n", prog);
-  printf("  -n <rows>   number of rows in the database (128..%d, default 2000000,\n", MAX_ROWS);
-  printf("              rounded down to a multiple of 128)\n");
+  printf("  -n <rows>   number of rows in the database (default 2000000, min 128,\n");
+  printf("              rounded down to a multiple of 128; limited only by memory,\n");
+  printf("              roughly (4*bits + 4) bytes per row)\n");
   printf("  -b <bits>   number of bits per value (1..32, default 32)\n");
   printf("  -l <loops>  number of measurement loops (default 50)\n");
   printf("  -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)\n");
@@ -140,9 +139,9 @@ int main (int argc, char **argv)
       case 'n':
       {
         long n = atol(optarg);
-        if (n < 128 || n > MAX_ROWS)
+        if (n < 128 || n > 2000000000L)
         {
-          fprintf(stderr, "Error: -n must be between 128 and %d\n", MAX_ROWS);
+          fprintf(stderr, "Error: -n must be between 128 and 2000000000\n");
           return EXIT_FAILURE;
         }
         if (n % 128 != 0)
@@ -245,6 +244,25 @@ int main (int argc, char **argv)
   }
   printf("Threads (OpenMP)    : %d\n", active_threads);
   printf("Compiler            : %s\n", COMPILER_NAME);
+  double mem_mb = ((double)C_length * B * sizeof(int) + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
+  printf("Memory for the data : %.1f MB\n", mem_mb);
+
+  // one bit is stored as one int, so a bit-plane needs 4 bytes per row
+  for (int bit = 0; bit < B; bit++)
+  {
+    C[bit] = (int*)malloc((size_t)C_length * sizeof(int));
+    if (C[bit] == NULL)
+    {
+      fprintf(stderr, "Error: failed to allocate %.1f MB for the bit-planes, use a smaller -n\n", mem_mb);
+      return EXIT_FAILURE;
+    }
+  }
+  V = (uint32_t*)malloc((size_t)C_length * sizeof(uint32_t));
+  if (V == NULL)
+  {
+    fprintf(stderr, "Error: failed to allocate %.1f MB for the data, use a smaller -n\n", mem_mb);
+    return EXIT_FAILURE;
+  }
 
   srand( (unsigned)time( NULL ) );
   for (int i = 0; i < C_length; i++)
@@ -372,6 +390,8 @@ int main (int argc, char **argv)
   cout << "Repeated for " << loop_num << " times. " << endl;
   cout << "Average Time: " << double(total_time / loop_num) << " s" << endl;
 
+  for (int bit = 0; bit < B; bit++) free(C[bit]);
+  free(V);
   return EXIT_SUCCESS;
 }
 

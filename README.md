@@ -10,8 +10,9 @@ $ ./bitweaving
 The dataset size, value width, number of loops, and the comparison predicate can be set from the command line:
 ```
 Usage: ./bitweaving [options]
-  -n <rows>   number of rows in the database (128..8000000, default 2000000,
-              rounded down to a multiple of 128)
+  -n <rows>   number of rows in the database (default 2000000, min 128,
+              rounded down to a multiple of 128; limited only by memory,
+              roughly (4*bits + 4) bytes per row)
   -b <bits>   number of bits per value (1..32, default 32)
   -l <loops>  number of measurement loops (default 50)
   -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)
@@ -25,6 +26,15 @@ For example, count rows equal to 42 among 1M 16-bit values:
 $ ./bitweaving -n 1000000 -b 16 -p eq -x 42
 ```
 All run options are printed at startup, and after each loop the SIMD result is verified against a plain scalar scan of the same data.
+### Benchmark sweep
+`benchmark.sh` runs the scan over every combination of rows x bits x threads and writes the average times, the speedup over 1 thread, and the verification result to `benchmark_results.csv`:
+```
+$ ./benchmark.sh
+```
+The sweep is customizable with environment variables:
+```
+$ ROWS_LIST="1000000 8000000" BITS_LIST="8 32" THREADS_LIST="1 2 4" LOOPS=10 ./benchmark.sh
+```
 ### About OpenMP
 The scan is parallelized with OpenMP: the 128-row periods of the VBP algorithm are independent, so they are distributed across threads and the match counts are combined with a reduction. Timing uses wall-clock time (`omp_get_wtime`), since `clock()` would sum the CPU time of all threads.
 ## Detail of the codes
