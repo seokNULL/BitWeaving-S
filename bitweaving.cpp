@@ -22,6 +22,9 @@
 #include <emmintrin.h>
 #include <pmmintrin.h>
 #include <xmmintrin.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <assert.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -94,6 +97,19 @@ static uint32_t rand32()
   return (((uint32_t)rand() << 17) ^ (uint32_t)rand());
 }
 
+// wall-clock time in seconds; clock() cannot be used with OpenMP because it
+// sums the CPU time of all threads
+static double wall_time()
+{
+#ifdef _OPENMP
+  return omp_get_wtime();
+#else
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec + tv.tv_usec * 1e-6;
+#endif
+}
+
 static void usage(const char *prog)
 {
   printf("Usage: %s [options]\n", prog);
@@ -104,6 +120,7 @@ static void usage(const char *prog)
   printf("  -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)\n");
   printf("  -x <value>  constant c (or c1 for 'between'); random per loop if omitted\n");
   printf("  -y <value>  constant c2, only used with 'between'; random per loop if omitted\n");
+  printf("  -t <num>    number of OpenMP threads (default: all available)\n");
   printf("  -h          show this help\n");
 }
 
@@ -113,9 +130,10 @@ int main (int argc, char **argv)
   Predicate pred = PRED_BETWEEN;
   bool has_x = false, has_y = false;
   uint32_t user_c1 = 0, user_c2 = 0;
+  int num_threads = 0; // 0 = OpenMP default (all available)
 
   int opt;
-  while ((opt = getopt(argc, argv, "n:b:l:p:x:y:h")) != -1)
+  while ((opt = getopt(argc, argv, "n:b:l:p:x:y:t:h")) != -1)
   {
     switch (opt)
     {
@@ -174,6 +192,14 @@ int main (int argc, char **argv)
         user_c2 = (uint32_t)strtoul(optarg, NULL, 0);
         has_y = true;
         break;
+      case 't':
+        num_threads = atoi(optarg);
+        if (num_threads < 1)
+        {
+          fprintf(stderr, "Error: -t must be at least 1\n");
+          return EXIT_FAILURE;
+        }
+        break;
       case 'h':
         usage(argv[0]);
         return EXIT_SUCCESS;
@@ -195,7 +221,30 @@ int main (int argc, char **argv)
     return EXIT_FAILURE;
   }
 
-  printf("Rows: %d, bits per value: %d, loops: %d, predicate: %s\n", C_length, B, loop_num, pred_name(pred));
+#ifdef _OPENMP
+  if (num_threads > 0) omp_set_num_threads(num_threads);
+  int active_threads = omp_get_max_threads();
+#else
+  int active_threads = 1;
+  if (num_threads > 1) fprintf(stderr, "Warning: built without OpenMP, -t ignored (single thread)\n");
+#endif
+
+  printf("*****Configuration: ********************************************************************************\n");
+  printf("Rows (dataset size) : %d\n", C_length);
+  printf("Bits per value      : %d\n", B);
+  printf("Loops               : %d\n", loop_num);
+  printf("Predicate           : %s\n", pred_name(pred));
+  if (pred == PRED_BETWEEN)
+  {
+    if (has_x) printf("Constant c1         : %u\n", user_c1); else printf("Constant c1         : random per loop\n");
+    if (has_y) printf("Constant c2         : %u\n", user_c2); else printf("Constant c2         : random per loop\n");
+  }
+  else
+  {
+    if (has_x) printf("Constant c          : %u\n", user_c1); else printf("Constant c          : random per loop\n");
+  }
+  printf("Threads (OpenMP)    : %d\n", active_threads);
+  printf("Compiler            : %s\n", COMPILER_NAME);
 
   srand( (unsigned)time( NULL ) );
   for (int i = 0; i < C_length; i++)
@@ -231,10 +280,10 @@ int main (int argc, char **argv)
 	  	c2 = c1; // single-constant predicates use the same constant on both sides
 	  	printf("C: %u\n", c1);
 	  }
-	  clock_t startTime, endTime;
+	  double startTime, endTime;
 	  long long matches = 0;
 
-	  startTime = clock();
+	  startTime = wall_time();
 	  vector<int> c1_bits;
 	  for (int bit = 0; bit < B; bit++) {c1_bits.push_back((c1 >> (B-bit-1)) & 1);}
 	  vector<int> c2_bits;
@@ -246,8 +295,11 @@ int main (int argc, char **argv)
 	  vector<__m128i> c2_128;
       for (int bit = 0; bit < B; bit++) {c2_128.push_back(_mm_set_epi32(c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff));}
 	  
-	  int section_num = C_length / 32; 
+	  int section_num = C_length / 32;
 	  int period_num = C_length / 128; //4 sections executed in parallel
+	  // periods are independent of each other, so they can be distributed
+	  // across OpenMP threads; matches is summed up by the reduction
+	  #pragma omp parallel for reduction(+:matches)
 	  for (int period = 0; period < period_num; period++)
 	  {
 		// section #0, #1, #2, #3 
@@ -286,8 +338,8 @@ int main (int argc, char **argv)
 		memcpy(r, &period_result, sizeof(r));
 		matches += __builtin_popcount(r[0]) + __builtin_popcount(r[1]) + __builtin_popcount(r[2]) + __builtin_popcount(r[3]);
 	  }
-	  endTime = clock();
-	  double time = (double)(endTime - startTime) / CLOCKS_PER_SEC;
+	  endTime = wall_time();
+	  double time = endTime - startTime;
 	  cout << "Time: " << time << ", matching rows: " << matches << endl;
 	  total_time += time;
 	  //cout << total_time << endl;
@@ -316,7 +368,7 @@ int main (int argc, char **argv)
   }
   printf("*****Summary: **************************************************************************************\n");
   printf("%d Rows of data, each data represented by %d bits.\n", C_length, B);
-  printf("Predicate: %s\n", pred_name(pred));
+  printf("Predicate: %s, %d OpenMP thread(s).\n", pred_name(pred), active_threads);
   cout << "Repeated for " << loop_num << " times. " << endl;
   cout << "Average Time: " << double(total_time / loop_num) << " s" << endl;
 

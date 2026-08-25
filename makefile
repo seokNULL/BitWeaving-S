@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -mavx2 -O2 -g
+CXXFLAGS ?= -mavx2 -O2 -g -fopenmp
 TARGET    = bitweaving
 
 .PHONY: all clean
