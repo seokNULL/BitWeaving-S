@@ -37,6 +37,11 @@ The sweep is customizable with environment variables:
 ```
 $ ROWS_LIST="1000000 8000000" BITS_LIST="8 32" THREADS_LIST="1 2 4" LOOPS=10 ./benchmark.sh
 ```
+### CPU energy measurement
+When available, the CPU energy consumed by each scan is measured with Intel RAPL through the Linux powercap interface (`/sys/class/powercap/intel-rapl:N/energy_uj`) and reported per loop together with the average power, plus an average in the summary and a column in the benchmark CSV. Notes:
+- RAPL counters cover the **whole CPU socket**, not just this process — measure on an otherwise idle machine.
+- The counters need bare-metal Linux and are typically readable only by root since kernel 5.10 (`sudo ./bitweaving ...`, or relax the permissions on `energy_uj`). Inside containers/VMs they are usually not exposed at all; the program then reports `CPU energy (RAPL): not available` and skips energy reporting.
+- RAPL updates roughly every millisecond, so make each measurement long enough (large `-n`) for a meaningful reading.
 ### About OpenMP
 The scan is parallelized with OpenMP: the 128-row periods of the VBP algorithm are independent, so they are distributed across threads and the match counts are combined with a reduction. Timing uses wall-clock time (`omp_get_wtime`), since `clock()` would sum the CPU time of all threads.
 ## Detail of the codes

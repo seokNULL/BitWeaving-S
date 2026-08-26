@@ -108,6 +108,72 @@ static double wall_time()
 #endif
 }
 
+// ---- CPU energy via RAPL ---------------------------------------------------
+// Reads the CPU package energy counters exposed by the Linux powercap
+// interface (/sys/class/powercap/intel-rapl:N/energy_uj). The counters cover
+// the whole socket (all processes), update roughly every millisecond, and are
+// often readable only by root since kernel 5.10. In containers/VMs they are
+// usually not exposed at all; energy is then simply not reported.
+#define RAPL_MAX_DOMAINS 8
+static char rapl_energy_path[RAPL_MAX_DOMAINS][128];
+static double rapl_range_uj[RAPL_MAX_DOMAINS];
+static int rapl_domains = 0;
+
+static void rapl_init()
+{
+  for (int i = 0; i < RAPL_MAX_DOMAINS; i++)
+  {
+    char path[128];
+    char name[64] = "";
+    snprintf(path, sizeof(path), "/sys/class/powercap/intel-rapl:%d/name", i);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) continue;
+    if (fgets(name, sizeof(name), f) == NULL) name[0] = '\0';
+    fclose(f);
+    if (strncmp(name, "psys", 4) == 0) continue; // overlaps the package domains
+    snprintf(rapl_energy_path[rapl_domains], sizeof(rapl_energy_path[0]),
+             "/sys/class/powercap/intel-rapl:%d/energy_uj", i);
+    f = fopen(rapl_energy_path[rapl_domains], "r");
+    if (f == NULL) continue; // exists but not readable without root
+    fclose(f);
+    snprintf(path, sizeof(path), "/sys/class/powercap/intel-rapl:%d/max_energy_range_uj", i);
+    double range = 0;
+    f = fopen(path, "r");
+    if (f != NULL)
+    {
+      if (fscanf(f, "%lf", &range) != 1) range = 0;
+      fclose(f);
+    }
+    rapl_range_uj[rapl_domains] = range;
+    rapl_domains++;
+  }
+}
+
+static int rapl_read(double *uj)
+{
+  for (int d = 0; d < rapl_domains; d++)
+  {
+    FILE *f = fopen(rapl_energy_path[d], "r");
+    if (f == NULL) return -1;
+    if (fscanf(f, "%lf", &uj[d]) != 1) { fclose(f); return -1; }
+    fclose(f);
+  }
+  return 0;
+}
+
+// energy in joules between two counter snapshots, correcting counter wraparound
+static double rapl_delta_j(const double *before, const double *after)
+{
+  double sum_uj = 0;
+  for (int d = 0; d < rapl_domains; d++)
+  {
+    double delta = after[d] - before[d];
+    if (delta < 0 && rapl_range_uj[d] > 0) delta += rapl_range_uj[d];
+    sum_uj += delta;
+  }
+  return sum_uj / 1e6;
+}
+
 // Runs the VBP scan over all periods and returns the number of matching rows.
 // The predicate P is a compile-time constant, so only the mask updates that
 // this predicate actually needs are compiled into the bit loop:
@@ -305,6 +371,11 @@ int main (int argc, char **argv)
   }
   printf("Threads (OpenMP)    : %d\n", active_threads);
   printf("Compiler            : %s\n", COMPILER_NAME);
+  rapl_init();
+  if (rapl_domains > 0)
+    printf("CPU energy (RAPL)   : available, %d package domain(s); counters are per socket, not per process\n", rapl_domains);
+  else
+    printf("CPU energy (RAPL)   : not available (powercap not exposed or not readable; bare-metal Linux + root needed)\n");
   double mem_mb = ((double)C_length * B / 8.0 + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
   printf("Memory for the data : %.1f MB\n", mem_mb);
 
@@ -350,6 +421,8 @@ int main (int argc, char **argv)
   }
   printf("Packing the bit-planes took %f s (excluded from the scan times)\n", wall_time() - packStart);
   double total_time = 0;
+  double total_energy = 0;
+  int energy_loops = 0;
   for (int loop = 0; loop < loop_num; loop++)
   {
 	  printf("*****Loop #%d***************************************************************************************\n", loop);
@@ -385,7 +458,9 @@ int main (int argc, char **argv)
 	  }
 	  int period_num = C_length / 128; //4 sections executed in parallel
 
-	  // only the predicate kernel itself is measured
+	  // only the predicate kernel itself is measured (time and energy)
+	  double e_before[RAPL_MAX_DOMAINS], e_after[RAPL_MAX_DOMAINS];
+	  bool have_energy = (rapl_domains > 0 && rapl_read(e_before) == 0);
 	  startTime = wall_time();
 	  switch (pred)
 	  {
@@ -399,7 +474,15 @@ int main (int argc, char **argv)
 	  }
 	  endTime = wall_time();
 	  double time = endTime - startTime;
+	  double energy_j = -1;
+	  if (have_energy && rapl_read(e_after) == 0) energy_j = rapl_delta_j(e_before, e_after);
 	  cout << "Scan time: " << time << ", matching rows: " << matches << endl;
+	  if (energy_j >= 0)
+	  {
+	  	printf("CPU energy: %.4f J (avg power %.1f W, whole socket)\n", energy_j, energy_j / time);
+	  	total_energy += energy_j;
+	  	energy_loops++;
+	  }
 	  total_time += time;
 	  //cout << total_time << endl;
 
@@ -430,6 +513,8 @@ int main (int argc, char **argv)
   printf("Predicate: %s, %d OpenMP thread(s).\n", pred_name(pred), active_threads);
   cout << "Repeated for " << loop_num << " times. " << endl;
   cout << "Average Time: " << double(total_time / loop_num) << " s (scan kernel only)" << endl;
+  if (energy_loops > 0)
+    printf("Average CPU Energy: %f J per scan (package RAPL, whole socket)\n", total_energy / energy_loops);
 
   for (int bit = 0; bit < B; bit++) free(W[bit]);
   free(V);
