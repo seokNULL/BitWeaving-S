@@ -12,7 +12,7 @@ The dataset size, value width, number of loops, and the comparison predicate can
 Usage: ./bitweaving [options]
   -n <rows>   number of rows in the database (default 2000000, min 128,
               rounded down to a multiple of 128; limited only by memory,
-              roughly (4*bits + 4) bytes per row)
+              roughly (bits/8 + 4) bytes per row)
   -b <bits>   number of bits per value (1..32, default 32)
   -l <loops>  number of measurement loops (default 50)
   -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)
@@ -26,6 +26,8 @@ For example, count rows equal to 42 among 1M 16-bit values:
 $ ./bitweaving -n 1000000 -b 16 -p eq -x 42
 ```
 All run options are printed at startup, and after each loop the SIMD result is verified against a plain scalar scan of the same data.
+### Predicate-specialized kernels and what is measured
+The bit-planes are packed once at startup into `uint32` words (32 rows per word), so the scan kernel reads the vertical layout directly with SIMD loads. The kernel is specialized per predicate at compile time and only executes the mask updates that predicate needs per bit: 2 instructions for `eq`/`neq`, 5 for `lt`/`le`/`gt`/`ge`, and 10 for `between`. The reported times cover only this scan kernel — data generation, bit-plane packing, constant vector setup, and result verification are all excluded.
 ### Benchmark sweep
 `benchmark.sh` runs the scan over every combination of rows x bits x threads and writes the average times, the speedup over 1 thread, and the verification result to `benchmark_results.csv`:
 ```

@@ -70,8 +70,8 @@ using namespace std;
 //int C_length = 128; //number of data in the database
 int C_length = 2000000; //number of data in the database
 int B = 32;  // length of each data
-int *C[32];  // one bit-plane per bit, allocated at runtime for C_length rows
-uint32_t *V; // original values, kept for result verification
+uint32_t *W[32]; // packed bit-planes: one uint32 word holds one bit of 32 rows
+uint32_t *V;     // original values, kept for result verification
 
 // Supported comparison predicates
 enum Predicate { PRED_LT, PRED_LE, PRED_GT, PRED_GE, PRED_EQ, PRED_NEQ, PRED_BETWEEN };
@@ -108,12 +108,73 @@ static double wall_time()
 #endif
 }
 
+// Runs the VBP scan over all periods and returns the number of matching rows.
+// The predicate P is a compile-time constant, so only the mask updates that
+// this predicate actually needs are compiled into the bit loop:
+//   eq/neq            m_eq1                        2 instructions per bit
+//   lt/le             m_lt, m_eq2                  5 instructions per bit
+//   gt/ge             m_gt, m_eq1                  5 instructions per bit
+//   between           all four masks              10 instructions per bit
+template <Predicate P>
+static long long scan_kernel(int period_num, const __m128i *c1v, const __m128i *c2v)
+{
+  long long matches = 0;
+  // periods are independent of each other, so they can be distributed
+  // across OpenMP threads; matches is summed up by the reduction
+  #pragma omp parallel for reduction(+:matches)
+  for (int period = 0; period < period_num; period++)
+  {
+    // section #0, #1, #2, #3
+    __m128i m_lt_128 = _mm_setzero_si128();
+    __m128i m_gt_128 = _mm_setzero_si128();
+    __m128i m_eq1_128 = _mm_set1_epi32(0xffffffff);
+    __m128i m_eq2_128 = _mm_set1_epi32(0xffffffff);
+    for (int i = 0; i < B; i++)
+    {
+      // one bit of the 128 rows of this period, from the packed bit-plane
+      __m128i s_vi_128 = _mm_loadu_si128((const __m128i*)&W[i][period*4]);
+      if (P == PRED_GT || P == PRED_GE || P == PRED_BETWEEN)
+      {
+        // _mm_andnot_si128(a, b) computes (~a & b), so ~c1 needs no extra instruction
+        m_gt_128 = _mm_or_si128(m_gt_128, _mm_and_si128(m_eq1_128, _mm_andnot_si128(c1v[i], s_vi_128)));
+      }
+      if (P == PRED_LT || P == PRED_LE || P == PRED_BETWEEN)
+      {
+        m_lt_128 = _mm_or_si128(m_lt_128, _mm_and_si128(m_eq2_128, _mm_andnot_si128(s_vi_128, c2v[i])));
+      }
+      if (P == PRED_GT || P == PRED_GE || P == PRED_EQ || P == PRED_NEQ || P == PRED_BETWEEN)
+      {
+        m_eq1_128 = _mm_andnot_si128(_mm_xor_si128(s_vi_128, c1v[i]), m_eq1_128);
+      }
+      if (P == PRED_LT || P == PRED_LE || P == PRED_BETWEEN)
+      {
+        m_eq2_128 = _mm_andnot_si128(_mm_xor_si128(s_vi_128, c2v[i]), m_eq2_128);
+      }
+    }
+    __m128i period_result;
+    switch (P)
+    {
+      case PRED_LT:  period_result = m_lt_128; break;
+      case PRED_LE:  period_result = _mm_or_si128(m_lt_128, m_eq2_128); break;
+      case PRED_GT:  period_result = m_gt_128; break;
+      case PRED_GE:  period_result = _mm_or_si128(m_gt_128, m_eq1_128); break;
+      case PRED_EQ:  period_result = m_eq1_128; break;
+      case PRED_NEQ: period_result = _mm_not_si128(m_eq1_128); break;
+      default:       period_result = _mm_and_si128(m_gt_128, m_lt_128); break;
+    }
+    uint32_t r[4];
+    memcpy(r, &period_result, sizeof(r));
+    matches += __builtin_popcount(r[0]) + __builtin_popcount(r[1]) + __builtin_popcount(r[2]) + __builtin_popcount(r[3]);
+  }
+  return matches;
+}
+
 static void usage(const char *prog)
 {
   printf("Usage: %s [options]\n", prog);
   printf("  -n <rows>   number of rows in the database (default 2000000, min 128,\n");
   printf("              rounded down to a multiple of 128; limited only by memory,\n");
-  printf("              roughly (4*bits + 4) bytes per row)\n");
+  printf("              roughly (bits/8 + 4) bytes per row)\n");
   printf("  -b <bits>   number of bits per value (1..32, default 32)\n");
   printf("  -l <loops>  number of measurement loops (default 50)\n");
   printf("  -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)\n");
@@ -244,14 +305,15 @@ int main (int argc, char **argv)
   }
   printf("Threads (OpenMP)    : %d\n", active_threads);
   printf("Compiler            : %s\n", COMPILER_NAME);
-  double mem_mb = ((double)C_length * B * sizeof(int) + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
+  double mem_mb = ((double)C_length * B / 8.0 + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
   printf("Memory for the data : %.1f MB\n", mem_mb);
 
-  // one bit is stored as one int, so a bit-plane needs 4 bytes per row
+  // a bit-plane stores one bit of 32 rows in one uint32 word
+  int word_num = C_length / 32;
   for (int bit = 0; bit < B; bit++)
   {
-    C[bit] = (int*)malloc((size_t)C_length * sizeof(int));
-    if (C[bit] == NULL)
+    W[bit] = (uint32_t*)malloc((size_t)word_num * sizeof(uint32_t));
+    if (W[bit] == NULL)
     {
       fprintf(stderr, "Error: failed to allocate %.1f MB for the bit-planes, use a smaller -n\n", mem_mb);
       return EXIT_FAILURE;
@@ -267,13 +329,26 @@ int main (int argc, char **argv)
   srand( (unsigned)time( NULL ) );
   for (int i = 0; i < C_length; i++)
   {
-  	uint32_t data = rand32() & mask; // generate the data by random
-  	V[i] = data;
+  	V[i] = rand32() & mask; // generate the data by random
+  }
+  // pack the bit-planes; word w of plane 'bit' holds bit (B-bit-1) of rows
+  // [w*32, w*32+32), the first row in the highest word bit. This is done once
+  // up front and is not part of the measured scan time.
+  double packStart = wall_time();
+  #pragma omp parallel for
+  for (int w = 0; w < word_num; w++)
+  {
   	for (int bit = 0; bit < B; bit++)
   	{
-  	  C[bit][i] = (data >> (B-bit-1)) & 1;
+  	  uint32_t word = 0;
+  	  for (int k = 0; k < 32; k++)
+  	  {
+  	  	word = (word << 1) | ((V[w*32 + k] >> (B-bit-1)) & 1);
+  	  }
+  	  W[bit][w] = word;
   	}
   }
+  printf("Packing the bit-planes took %f s (excluded from the scan times)\n", wall_time() - packStart);
   double total_time = 0;
   for (int loop = 0; loop < loop_num; loop++)
   {
@@ -301,64 +376,30 @@ int main (int argc, char **argv)
 	  double startTime, endTime;
 	  long long matches = 0;
 
-	  startTime = wall_time();
-	  vector<int> c1_bits;
-	  for (int bit = 0; bit < B; bit++) {c1_bits.push_back((c1 >> (B-bit-1)) & 1);}
-	  vector<int> c2_bits;
-	  for (int bit = 0; bit < B; bit++) {c2_bits.push_back((c2 >> (B-bit-1)) & 1);}
-	  
-	  vector<__m128i> c1_128;
-	  for (int bit = 0; bit < B; bit++) {c1_128.push_back(_mm_set_epi32(c1_bits[bit]*0xffffffff,c1_bits[bit]*0xffffffff,c1_bits[bit]*0xffffffff,c1_bits[bit]*0xffffffff));}
-	  	  
-	  vector<__m128i> c2_128;
-      for (int bit = 0; bit < B; bit++) {c2_128.push_back(_mm_set_epi32(c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff,c2_bits[bit]*0xffffffff));}
-	  
-	  int section_num = C_length / 32;
-	  int period_num = C_length / 128; //4 sections executed in parallel
-	  // periods are independent of each other, so they can be distributed
-	  // across OpenMP threads; matches is summed up by the reduction
-	  #pragma omp parallel for reduction(+:matches)
-	  for (int period = 0; period < period_num; period++)
+	  // build the constant vectors; setup work, not part of the measured scan time
+	  __m128i c1v[32], c2v[32];
+	  for (int bit = 0; bit < B; bit++)
 	  {
-		// section #0, #1, #2, #3 
-		__m128i m_lt_128 = _mm_set_epi32(0,0,0,0);
-		__m128i m_gt_128 = _mm_set_epi32(0,0,0,0);
-		__m128i m_eq1_128 = _mm_set_epi32(0xffffffff,0xffffffff,0xffffffff,0xffffffff);
-		__m128i m_eq2_128 = _mm_set_epi32(0xffffffff,0xffffffff,0xffffffff,0xffffffff);
-		//print128i_4(m_lt_128); print128i_4(m_gt_128); print128i_4(m_eq1_128); print128i_4(m_eq2_128);
-		
-		for (int i = 0; i < B; i++)
-		{
-	  	  int s_vi_0 = bits2int(C[i][period*128], C[i][period*128+1], C[i][period*128+2], C[i][period*128+3],C[i][period*128+4], C[i][period*128+5], C[i][period*128+6], C[i][period*128+7],C[i][period*128+8], C[i][period*128+9], C[i][period*128+10], C[i][period*128+11],C[i][period*128+12], C[i][period*128+13], C[i][period*128+14], C[i][period*128+15],C[i][period*128+16], C[i][period*128+17], C[i][period*128+18], C[i][period*128+19],C[i][period*128+20], C[i][period*128+21], C[i][period*128+22], C[i][period*128+23],C[i][period*128+24], C[i][period*128+25], C[i][period*128+26], C[i][period*128+27],C[i][period*128+28], C[i][period*128+29], C[i][period*128+30], C[i][period*128+31]);
-	  	  //printf("%d\n", s_vi_0);
-	  	  int s_vi_1 = bits2int(C[i][period*128+32], C[i][period*128+1+32], C[i][period*128+2+32], C[i][period*128+3+32],C[i][period*128+4+32], C[i][period*128+5+32], C[i][period*128+6+32], C[i][period*128+7+32],C[i][period*128+8+32], C[i][period*128+9+32], C[i][period*128+10+32], C[i][period*128+11+32],C[i][period*128+12+32], C[i][period*128+13+32], C[i][period*128+14+32], C[i][period*128+15+32],C[i][period*128+16+32], C[i][period*128+17+32], C[i][period*128+18+32], C[i][period*128+19+32],C[i][period*128+20+32], C[i][period*128+21+32], C[i][period*128+22+32], C[i][period*128+23+32],C[i][period*128+24+32], C[i][period*128+25+32], C[i][period*128+26+32], C[i][period*128+27+32],C[i][period*128+28+32], C[i][period*128+29+32], C[i][period*128+30+32], C[i][period*128+31+32]);
-	  	  int s_vi_2 = bits2int(C[i][period*128+64], C[i][period*128+1+64], C[i][period*128+2+64], C[i][period*128+3+64],C[i][period*128+4+64], C[i][period*128+5+64], C[i][period*128+6+64], C[i][period*128+7+64],C[i][period*128+8+64], C[i][period*128+9+64], C[i][period*128+10+64], C[i][period*128+11+64],C[i][period*128+12+64], C[i][period*128+13+64], C[i][period*128+14+64], C[i][period*128+15+64],C[i][period*128+16+64], C[i][period*128+17+64], C[i][period*128+18+64], C[i][period*128+19+64],C[i][period*128+20+64], C[i][period*128+21+64], C[i][period*128+22+64], C[i][period*128+23+64],C[i][period*128+24+64], C[i][period*128+25+64], C[i][period*128+26+64], C[i][period*128+27+64],C[i][period*128+28+64], C[i][period*128+29+64], C[i][period*128+30+64], C[i][period*128+31+64]);
-	  	  int s_vi_3 = bits2int(C[i][period*128+96], C[i][period*128+1+96], C[i][period*128+2+96], C[i][period*128+3+96],C[i][period*128+4+96], C[i][period*128+5+96], C[i][period*128+6+96], C[i][period*128+7+96],C[i][period*128+8+96], C[i][period*128+9+96], C[i][period*128+10+96], C[i][period*128+11+96],C[i][period*128+12+96], C[i][period*128+13+96], C[i][period*128+14+96], C[i][period*128+15+96],C[i][period*128+16+96], C[i][period*128+17+96], C[i][period*128+18+96], C[i][period*128+19+96],C[i][period*128+20+96], C[i][period*128+21+96], C[i][period*128+22+96], C[i][period*128+23+96],C[i][period*128+24+96], C[i][period*128+25+96], C[i][period*128+26+96], C[i][period*128+27+96],C[i][period*128+28+96], C[i][period*128+29+96], C[i][period*128+30+96], C[i][period*128+31+96]);
-	  	  __m128i s_vi_128 = _mm_set_epi32(s_vi_3, s_vi_2, s_vi_1, s_vi_0);  //remind the order
-	  	  m_gt_128 = _mm_or_si128(m_gt_128, _mm_and_si128(m_eq1_128, _mm_and_si128(_mm_not_si128(c1_128[i]), s_vi_128)));
-	  	  m_lt_128 = _mm_or_si128(m_lt_128, _mm_and_si128(m_eq2_128, _mm_and_si128(c2_128[i], _mm_not_si128(s_vi_128))));
-		  m_eq1_128 = _mm_and_si128(m_eq1_128, _mm_not_si128(_mm_xor_si128(s_vi_128, c1_128[i])));
-		  m_eq2_128 = _mm_and_si128(m_eq2_128, _mm_not_si128(_mm_xor_si128(s_vi_128, c2_128[i])));
-		}
-		__m128i period_result;
-		switch (pred)
-		{
-		  case PRED_LT:  period_result = m_lt_128; break;
-		  case PRED_LE:  period_result = _mm_or_si128(m_lt_128, m_eq2_128); break;
-		  case PRED_GT:  period_result = m_gt_128; break;
-		  case PRED_GE:  period_result = _mm_or_si128(m_gt_128, m_eq1_128); break;
-		  case PRED_EQ:  period_result = m_eq1_128; break;
-		  case PRED_NEQ: period_result = _mm_not_si128(m_eq1_128); break;
-		  default:       period_result = _mm_and_si128(m_gt_128, m_lt_128); break;
-		}
-		//print128i_b(period_result);
-		uint32_t r[4];
-		memcpy(r, &period_result, sizeof(r));
-		matches += __builtin_popcount(r[0]) + __builtin_popcount(r[1]) + __builtin_popcount(r[2]) + __builtin_popcount(r[3]);
+	  	c1v[bit] = _mm_set1_epi32(((c1 >> (B-bit-1)) & 1) ? 0xffffffff : 0);
+	  	c2v[bit] = _mm_set1_epi32(((c2 >> (B-bit-1)) & 1) ? 0xffffffff : 0);
+	  }
+	  int period_num = C_length / 128; //4 sections executed in parallel
+
+	  // only the predicate kernel itself is measured
+	  startTime = wall_time();
+	  switch (pred)
+	  {
+	    case PRED_LT:  matches = scan_kernel<PRED_LT>(period_num, c1v, c2v); break;
+	    case PRED_LE:  matches = scan_kernel<PRED_LE>(period_num, c1v, c2v); break;
+	    case PRED_GT:  matches = scan_kernel<PRED_GT>(period_num, c1v, c2v); break;
+	    case PRED_GE:  matches = scan_kernel<PRED_GE>(period_num, c1v, c2v); break;
+	    case PRED_EQ:  matches = scan_kernel<PRED_EQ>(period_num, c1v, c2v); break;
+	    case PRED_NEQ: matches = scan_kernel<PRED_NEQ>(period_num, c1v, c2v); break;
+	    default:       matches = scan_kernel<PRED_BETWEEN>(period_num, c1v, c2v); break;
 	  }
 	  endTime = wall_time();
 	  double time = endTime - startTime;
-	  cout << "Time: " << time << ", matching rows: " << matches << endl;
+	  cout << "Scan time: " << time << ", matching rows: " << matches << endl;
 	  total_time += time;
 	  //cout << total_time << endl;
 
@@ -388,9 +429,9 @@ int main (int argc, char **argv)
   printf("%d Rows of data, each data represented by %d bits.\n", C_length, B);
   printf("Predicate: %s, %d OpenMP thread(s).\n", pred_name(pred), active_threads);
   cout << "Repeated for " << loop_num << " times. " << endl;
-  cout << "Average Time: " << double(total_time / loop_num) << " s" << endl;
+  cout << "Average Time: " << double(total_time / loop_num) << " s (scan kernel only)" << endl;
 
-  for (int bit = 0; bit < B; bit++) free(C[bit]);
+  for (int bit = 0; bit < B; bit++) free(W[bit]);
   free(V);
   return EXIT_SUCCESS;
 }
