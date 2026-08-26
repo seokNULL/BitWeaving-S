@@ -114,38 +114,69 @@ static double wall_time()
 // the whole socket (all processes), update roughly every millisecond, and are
 // often readable only by root since kernel 5.10. In containers/VMs they are
 // usually not exposed at all; energy is then simply not reported.
-#define RAPL_MAX_DOMAINS 8
-static char rapl_energy_path[RAPL_MAX_DOMAINS][128];
+#define RAPL_MAX_DOMAINS 16
+static char rapl_energy_path[RAPL_MAX_DOMAINS][160];
 static double rapl_range_uj[RAPL_MAX_DOMAINS];
+static int rapl_is_dram[RAPL_MAX_DOMAINS];
 static int rapl_domains = 0;
+static int rapl_pkg_domains = 0;
+static int rapl_dram_domains = 0;
+
+// reads <base>/name into name; returns 0 on success
+static int rapl_read_name(const char *base, char *name, size_t name_len)
+{
+  char path[192];
+  snprintf(path, sizeof(path), "%s/name", base);
+  FILE *f = fopen(path, "r");
+  if (f == NULL) return -1;
+  if (fgets(name, name_len, f) == NULL) name[0] = '\0';
+  fclose(f);
+  return 0;
+}
+
+static void rapl_add_domain(const char *base, int is_dram)
+{
+  char path[192];
+  FILE *f;
+  if (rapl_domains >= RAPL_MAX_DOMAINS) return;
+  snprintf(path, sizeof(path), "%s/energy_uj", base);
+  f = fopen(path, "r");
+  if (f == NULL) return; // not readable without root
+  fclose(f);
+  snprintf(rapl_energy_path[rapl_domains], sizeof(rapl_energy_path[0]), "%s", path);
+  snprintf(path, sizeof(path), "%s/max_energy_range_uj", base);
+  double range = 0;
+  f = fopen(path, "r");
+  if (f != NULL)
+  {
+    if (fscanf(f, "%lf", &range) != 1) range = 0;
+    fclose(f);
+  }
+  rapl_range_uj[rapl_domains] = range;
+  rapl_is_dram[rapl_domains] = is_dram;
+  if (is_dram) rapl_dram_domains++; else rapl_pkg_domains++;
+  rapl_domains++;
+}
 
 static void rapl_init()
 {
-  for (int i = 0; i < RAPL_MAX_DOMAINS; i++)
+  for (int i = 0; i < 8; i++)
   {
-    char path[128];
-    char name[64] = "";
-    snprintf(path, sizeof(path), "/sys/class/powercap/intel-rapl:%d/name", i);
-    FILE *f = fopen(path, "r");
-    if (f == NULL) continue;
-    if (fgets(name, sizeof(name), f) == NULL) name[0] = '\0';
-    fclose(f);
+    char base[128];
+    char name[64];
+    snprintf(base, sizeof(base), "/sys/class/powercap/intel-rapl:%d", i);
+    if (rapl_read_name(base, name, sizeof(name)) != 0) continue;
     if (strncmp(name, "psys", 4) == 0) continue; // overlaps the package domains
-    snprintf(rapl_energy_path[rapl_domains], sizeof(rapl_energy_path[0]),
-             "/sys/class/powercap/intel-rapl:%d/energy_uj", i);
-    f = fopen(rapl_energy_path[rapl_domains], "r");
-    if (f == NULL) continue; // exists but not readable without root
-    fclose(f);
-    snprintf(path, sizeof(path), "/sys/class/powercap/intel-rapl:%d/max_energy_range_uj", i);
-    double range = 0;
-    f = fopen(path, "r");
-    if (f != NULL)
+    rapl_add_domain(base, 0); // package (cores + uncore, without DRAM)
+    // the dram counter is a subdomain of the package and NOT included in it,
+    // so package + dram together give the total energy
+    for (int j = 0; j < 8; j++)
     {
-      if (fscanf(f, "%lf", &range) != 1) range = 0;
-      fclose(f);
+      char sub[144];
+      snprintf(sub, sizeof(sub), "/sys/class/powercap/intel-rapl:%d:%d", i, j);
+      if (rapl_read_name(sub, name, sizeof(name)) != 0) continue;
+      if (strncmp(name, "dram", 4) == 0) rapl_add_domain(sub, 1);
     }
-    rapl_range_uj[rapl_domains] = range;
-    rapl_domains++;
   }
 }
 
@@ -161,17 +192,19 @@ static int rapl_read(double *uj)
   return 0;
 }
 
-// energy in joules between two counter snapshots, correcting counter wraparound
-static double rapl_delta_j(const double *before, const double *after)
+// energy in joules between two counter snapshots, split into package and dram,
+// correcting counter wraparound
+static void rapl_delta_j(const double *before, const double *after, double *pkg_j, double *dram_j)
 {
-  double sum_uj = 0;
+  double pkg_uj = 0, dram_uj = 0;
   for (int d = 0; d < rapl_domains; d++)
   {
     double delta = after[d] - before[d];
     if (delta < 0 && rapl_range_uj[d] > 0) delta += rapl_range_uj[d];
-    sum_uj += delta;
+    if (rapl_is_dram[d]) dram_uj += delta; else pkg_uj += delta;
   }
-  return sum_uj / 1e6;
+  *pkg_j = pkg_uj / 1e6;
+  *dram_j = dram_uj / 1e6;
 }
 
 // Runs the VBP scan over all periods and returns the number of matching rows.
@@ -373,7 +406,7 @@ int main (int argc, char **argv)
   printf("Compiler            : %s\n", COMPILER_NAME);
   rapl_init();
   if (rapl_domains > 0)
-    printf("CPU energy (RAPL)   : available, %d package domain(s); counters are per socket, not per process\n", rapl_domains);
+    printf("CPU energy (RAPL)   : available, %d package + %d dram domain(s); counters are per socket, not per process\n", rapl_pkg_domains, rapl_dram_domains);
   else
     printf("CPU energy (RAPL)   : not available (powercap not exposed or not readable; bare-metal Linux + root needed)\n");
   double mem_mb = ((double)C_length * B / 8.0 + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
@@ -421,7 +454,8 @@ int main (int argc, char **argv)
   }
   printf("Packing the bit-planes took %f s (excluded from the scan times)\n", wall_time() - packStart);
   double total_time = 0;
-  double total_energy = 0;
+  double total_pkg_energy = 0;
+  double total_dram_energy = 0;
   int energy_loops = 0;
   for (int loop = 0; loop < loop_num; loop++)
   {
@@ -474,13 +508,16 @@ int main (int argc, char **argv)
 	  }
 	  endTime = wall_time();
 	  double time = endTime - startTime;
-	  double energy_j = -1;
-	  if (have_energy && rapl_read(e_after) == 0) energy_j = rapl_delta_j(e_before, e_after);
+	  double pkg_j = -1, dram_j = -1;
+	  if (have_energy && rapl_read(e_after) == 0) rapl_delta_j(e_before, e_after, &pkg_j, &dram_j);
 	  cout << "Scan time: " << time << ", matching rows: " << matches << endl;
-	  if (energy_j >= 0)
+	  if (pkg_j >= 0)
 	  {
-	  	printf("CPU energy: %.4f J (avg power %.1f W, whole socket)\n", energy_j, energy_j / time);
-	  	total_energy += energy_j;
+	  	printf("CPU energy: package %.4f J (%.1f W)", pkg_j, pkg_j / time);
+	  	if (rapl_dram_domains > 0) printf(" + DRAM %.4f J (%.1f W)", dram_j, dram_j / time);
+	  	printf(" [whole socket]\n");
+	  	total_pkg_energy += pkg_j;
+	  	total_dram_energy += dram_j;
 	  	energy_loops++;
 	  }
 	  total_time += time;
@@ -514,7 +551,11 @@ int main (int argc, char **argv)
   cout << "Repeated for " << loop_num << " times. " << endl;
   cout << "Average Time: " << double(total_time / loop_num) << " s (scan kernel only)" << endl;
   if (energy_loops > 0)
-    printf("Average CPU Energy: %f J per scan (package RAPL, whole socket)\n", total_energy / energy_loops);
+  {
+    printf("Average package energy: %f J per scan (RAPL, whole socket)\n", total_pkg_energy / energy_loops);
+    if (rapl_dram_domains > 0)
+      printf("Average DRAM energy: %f J per scan (RAPL, whole socket)\n", total_dram_energy / energy_loops);
+  }
 
   for (int bit = 0; bit < B; bit++) free(W[bit]);
   free(V);

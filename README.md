@@ -38,8 +38,8 @@ The sweep is customizable with environment variables:
 $ ROWS_LIST="1000000 8000000" BITS_LIST="8 32" THREADS_LIST="1 2 4" LOOPS=10 ./benchmark.sh
 ```
 ### CPU energy measurement
-When available, the CPU energy consumed by each scan is measured with Intel RAPL through the Linux powercap interface (`/sys/class/powercap/intel-rapl:N/energy_uj`) and reported per loop together with the average power, plus an average in the summary and a column in the benchmark CSV. Notes:
-- RAPL counters cover the **whole CPU socket**, not just this process — measure on an otherwise idle machine.
+When available, the energy consumed by each scan is measured with Intel RAPL through the Linux powercap interface and reported per loop together with the average power, plus averages in the summary and columns in the benchmark CSV. Two RAPL domains are read: the **package** domain (`intel-rapl:N` — cores + uncore of the socket) and, where the CPU exposes it (mostly server/Xeon parts), the **dram** subdomain (`intel-rapl:N:M`). DRAM energy is *not* included in the package counter, so package + DRAM together give the total. Notes:
+- RAPL counters cover the **whole socket / memory system**, not just this process — measure on an otherwise idle machine.
 - The counters need bare-metal Linux and are typically readable only by root since kernel 5.10 (`sudo ./bitweaving ...`, or relax the permissions on `energy_uj`). Inside containers/VMs they are usually not exposed at all; the program then reports `CPU energy (RAPL): not available` and skips energy reporting.
 - RAPL updates roughly every millisecond, so make each measurement long enough (large `-n`) for a meaningful reading.
 ### About OpenMP
