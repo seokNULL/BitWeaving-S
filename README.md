@@ -11,14 +11,16 @@ The dataset size, value width, number of loops, and the comparison predicate can
 ```
 Usage: ./bitweaving [options]
   -n <rows>   number of rows in the database (default 2000000, min 128,
-              rounded down to a multiple of 128; limited only by memory,
-              roughly (bits/8 + 4) bytes per row)
+              K/M/G suffixes accepted, e.g. -n 256G; rounded down to a
+              multiple of 128; limited only by memory, bits/8 bytes per row)
   -b <bits>   number of bits per value (1..32, default 32)
   -l <loops>  number of measurement loops (default 50)
   -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)
   -x <value>  constant c (or c1 for 'between'); random per loop if omitted
   -y <value>  constant c2, only used with 'between'; random per loop if omitted
   -t <num>    number of OpenMP threads (default: all available)
+  -s          skip the scalar verification pass after each loop
+              (recommended for very large -n; it costs O(rows) per loop)
   -h          show this help
 ```
 For example, count rows equal to 42 among 1M 16-bit values:
@@ -27,6 +29,8 @@ $ ./bitweaving -n 1000000 -b 16 -p eq -x 42
 ```
 All run options are printed at startup, and after each loop the SIMD result is verified against a plain scalar scan of the same data.
 ### Predicate-specialized kernels and what is measured
+Row counts use 64-bit indices throughout, so datasets far beyond 2^31 rows work (e.g. `-n 256G` = 2.56e11 rows = 1 TB of bit-planes at 32 bits). Row values come from a deterministic index-based generator (splitmix64), so the original values are never stored — the verification pass recomputes them from the row index — and the memory footprint is just the packed bit-planes, `bits/8` bytes per row.
+
 The bit-planes are packed once at startup into `uint32` words (32 rows per word), so the scan kernel reads the vertical layout directly with SIMD loads. The kernel is specialized per predicate at compile time and only executes the mask updates that predicate needs per bit: 2 instructions for `eq`/`neq`, 5 for `lt`/`le`/`gt`/`ge`, and 10 for `between`. The reported times cover only this scan kernel — data generation, bit-plane packing, constant vector setup, and result verification are all excluded.
 ### Benchmark sweep
 `benchmark.sh` runs the scan over every combination of rows x bits x threads and writes the average times, the speedup over 1 thread, and the verification result to `benchmark_results.csv`:

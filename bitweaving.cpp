@@ -67,11 +67,26 @@
 
 using namespace std;
 
-//int C_length = 128; //number of data in the database
-int C_length = 2000000; //number of data in the database
+long long C_length = 2000000; //number of data in the database
 int B = 32;  // length of each data
 uint32_t *W[32]; // packed bit-planes: one uint32 word holds one bit of 32 rows
-uint32_t *V;     // original values, kept for result verification
+uint64_t data_seed; // seed of the index-based generator below
+
+// Deterministic value of row i (splitmix64). Because every row can be
+// recomputed from its index, the original values never need to be stored,
+// which matters for very large row counts.
+static inline uint64_t splitmix64(uint64_t x)
+{
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
+static inline uint32_t value_at(long long i, uint32_t mask)
+{
+  return (uint32_t)splitmix64(data_seed + (uint64_t)i) & mask;
+}
 
 // Supported comparison predicates
 enum Predicate { PRED_LT, PRED_LE, PRED_GT, PRED_GE, PRED_EQ, PRED_NEQ, PRED_BETWEEN };
@@ -115,7 +130,7 @@ static double wall_time()
 // often readable only by root since kernel 5.10. In containers/VMs they are
 // usually not exposed at all; energy is then simply not reported.
 #define RAPL_MAX_DOMAINS 16
-static char rapl_energy_path[RAPL_MAX_DOMAINS][160];
+static char rapl_energy_path[RAPL_MAX_DOMAINS][192];
 static double rapl_range_uj[RAPL_MAX_DOMAINS];
 static int rapl_is_dram[RAPL_MAX_DOMAINS];
 static int rapl_domains = 0;
@@ -215,13 +230,13 @@ static void rapl_delta_j(const double *before, const double *after, double *pkg_
 //   gt/ge             m_gt, m_eq1                  5 instructions per bit
 //   between           all four masks              10 instructions per bit
 template <Predicate P>
-static long long scan_kernel(int period_num, const __m128i *c1v, const __m128i *c2v)
+static long long scan_kernel(long long period_num, const __m128i *c1v, const __m128i *c2v)
 {
   long long matches = 0;
   // periods are independent of each other, so they can be distributed
   // across OpenMP threads; matches is summed up by the reduction
   #pragma omp parallel for reduction(+:matches)
-  for (int period = 0; period < period_num; period++)
+  for (long long period = 0; period < period_num; period++)
   {
     // section #0, #1, #2, #3
     __m128i m_lt_128 = _mm_setzero_si128();
@@ -272,14 +287,16 @@ static void usage(const char *prog)
 {
   printf("Usage: %s [options]\n", prog);
   printf("  -n <rows>   number of rows in the database (default 2000000, min 128,\n");
-  printf("              rounded down to a multiple of 128; limited only by memory,\n");
-  printf("              roughly (bits/8 + 4) bytes per row)\n");
+  printf("              K/M/G suffixes accepted, e.g. -n 256G; rounded down to a\n");
+  printf("              multiple of 128; limited only by memory, bits/8 bytes per row)\n");
   printf("  -b <bits>   number of bits per value (1..32, default 32)\n");
   printf("  -l <loops>  number of measurement loops (default 50)\n");
   printf("  -p <pred>   predicate: lt | le | gt | ge | eq | neq | between (default between)\n");
   printf("  -x <value>  constant c (or c1 for 'between'); random per loop if omitted\n");
   printf("  -y <value>  constant c2, only used with 'between'; random per loop if omitted\n");
   printf("  -t <num>    number of OpenMP threads (default: all available)\n");
+  printf("  -s          skip the scalar verification pass after each loop\n");
+  printf("              (recommended for very large -n; it costs O(rows) per loop)\n");
   printf("  -h          show this help\n");
 }
 
@@ -290,26 +307,41 @@ int main (int argc, char **argv)
   bool has_x = false, has_y = false;
   uint32_t user_c1 = 0, user_c2 = 0;
   int num_threads = 0; // 0 = OpenMP default (all available)
+  bool skip_verify = false;
 
   int opt;
-  while ((opt = getopt(argc, argv, "n:b:l:p:x:y:t:h")) != -1)
+  while ((opt = getopt(argc, argv, "n:b:l:p:x:y:t:sh")) != -1)
   {
     switch (opt)
     {
       case 'n':
       {
-        long n = atol(optarg);
-        if (n < 128 || n > 2000000000L)
+        char *end = NULL;
+        long long n = strtoll(optarg, &end, 10);
+        long long mult = 1;
+        if (end != NULL && end[0] != '\0')
         {
-          fprintf(stderr, "Error: -n must be between 128 and 2000000000\n");
+          if      ((end[0] == 'K' || end[0] == 'k') && end[1] == '\0') mult = 1000LL;
+          else if ((end[0] == 'M' || end[0] == 'm') && end[1] == '\0') mult = 1000000LL;
+          else if ((end[0] == 'G' || end[0] == 'g') && end[1] == '\0') mult = 1000000000LL;
+          else
+          {
+            fprintf(stderr, "Error: cannot parse -n '%s' (use a number with an optional K/M/G suffix)\n", optarg);
+            return EXIT_FAILURE;
+          }
+        }
+        n *= mult;
+        if (n < 128 || n > 1000000000000LL)
+        {
+          fprintf(stderr, "Error: -n must be between 128 and 1T (1000000000000)\n");
           return EXIT_FAILURE;
         }
         if (n % 128 != 0)
         {
-          fprintf(stderr, "Warning: -n %ld rounded down to %ld (multiple of 128)\n", n, n - n % 128);
+          fprintf(stderr, "Warning: -n %lld rounded down to %lld (multiple of 128)\n", n, n - n % 128);
           n -= n % 128;
         }
-        C_length = (int)n;
+        C_length = n;
         break;
       }
       case 'b':
@@ -359,6 +391,9 @@ int main (int argc, char **argv)
           return EXIT_FAILURE;
         }
         break;
+      case 's':
+        skip_verify = true;
+        break;
       case 'h':
         usage(argv[0]);
         return EXIT_SUCCESS;
@@ -389,9 +424,10 @@ int main (int argc, char **argv)
 #endif
 
   printf("*****Configuration: ********************************************************************************\n");
-  printf("Rows (dataset size) : %d\n", C_length);
+  printf("Rows (dataset size) : %lld\n", C_length);
   printf("Bits per value      : %d\n", B);
   printf("Loops               : %d\n", loop_num);
+  printf("Verification        : %s\n", skip_verify ? "disabled (-s)" : "scalar re-scan after every loop");
   printf("Predicate           : %s\n", pred_name(pred));
   if (pred == PRED_BETWEEN)
   {
@@ -409,11 +445,11 @@ int main (int argc, char **argv)
     printf("CPU energy (RAPL)   : available, %d package + %d dram domain(s); counters are per socket, not per process\n", rapl_pkg_domains, rapl_dram_domains);
   else
     printf("CPU energy (RAPL)   : not available (powercap not exposed or not readable; bare-metal Linux + root needed)\n");
-  double mem_mb = ((double)C_length * B / 8.0 + (double)C_length * sizeof(uint32_t)) / (1024.0 * 1024.0);
+  double mem_mb = ((double)C_length * B / 8.0) / (1024.0 * 1024.0);
   printf("Memory for the data : %.1f MB\n", mem_mb);
 
   // a bit-plane stores one bit of 32 rows in one uint32 word
-  int word_num = C_length / 32;
+  long long word_num = C_length / 32;
   for (int bit = 0; bit < B; bit++)
   {
     W[bit] = (uint32_t*)malloc((size_t)word_num * sizeof(uint32_t));
@@ -423,36 +459,30 @@ int main (int argc, char **argv)
       return EXIT_FAILURE;
     }
   }
-  V = (uint32_t*)malloc((size_t)C_length * sizeof(uint32_t));
-  if (V == NULL)
-  {
-    fprintf(stderr, "Error: failed to allocate %.1f MB for the data, use a smaller -n\n", mem_mb);
-    return EXIT_FAILURE;
-  }
 
-  srand( (unsigned)time( NULL ) );
-  for (int i = 0; i < C_length; i++)
-  {
-  	V[i] = rand32() & mask; // generate the data by random
-  }
-  // pack the bit-planes; word w of plane 'bit' holds bit (B-bit-1) of rows
-  // [w*32, w*32+32), the first row in the highest word bit. This is done once
-  // up front and is not part of the measured scan time.
+  srand( (unsigned)time( NULL ) ); // for the per-loop constants
+  data_seed = ((uint64_t)time(NULL) << 32) ^ (uint64_t)rand();
+  // Generate the data and pack the bit-planes: word w of plane 'bit' holds bit
+  // (B-bit-1) of rows [w*32, w*32+32), the first row in the highest word bit.
+  // Row values come from the index-based generator, so no value array is kept.
+  // This is done once up front and is not part of the measured scan time.
   double packStart = wall_time();
   #pragma omp parallel for
-  for (int w = 0; w < word_num; w++)
+  for (long long w = 0; w < word_num; w++)
   {
+  	uint32_t vals[32];
+  	for (int k = 0; k < 32; k++) {vals[k] = value_at(w*32 + k, mask);}
   	for (int bit = 0; bit < B; bit++)
   	{
   	  uint32_t word = 0;
   	  for (int k = 0; k < 32; k++)
   	  {
-  	  	word = (word << 1) | ((V[w*32 + k] >> (B-bit-1)) & 1);
+  	  	word = (word << 1) | ((vals[k] >> (B-bit-1)) & 1);
   	  }
   	  W[bit][w] = word;
   	}
   }
-  printf("Packing the bit-planes took %f s (excluded from the scan times)\n", wall_time() - packStart);
+  printf("Generating and packing the bit-planes took %f s (excluded from the scan times)\n", wall_time() - packStart);
   double total_time = 0;
   double total_pkg_energy = 0;
   double total_dram_energy = 0;
@@ -490,7 +520,7 @@ int main (int argc, char **argv)
 	  	c1v[bit] = _mm_set1_epi32(((c1 >> (B-bit-1)) & 1) ? 0xffffffff : 0);
 	  	c2v[bit] = _mm_set1_epi32(((c2 >> (B-bit-1)) & 1) ? 0xffffffff : 0);
 	  }
-	  int period_num = C_length / 128; //4 sections executed in parallel
+	  long long period_num = C_length / 128; //4 sections executed in parallel
 
 	  // only the predicate kernel itself is measured (time and energy)
 	  double e_before[RAPL_MAX_DOMAINS], e_after[RAPL_MAX_DOMAINS];
@@ -523,30 +553,36 @@ int main (int argc, char **argv)
 	  total_time += time;
 	  //cout << total_time << endl;
 
-	  // verify against a plain scalar scan (not part of the measured time)
-	  long long expected = 0;
-	  for (int i = 0; i < C_length; i++)
+	  // verify against a plain scalar scan, recomputing every row value from
+	  // its index (not part of the measured time)
+	  if (!skip_verify)
 	  {
-	  	bool match;
-	  	switch (pred)
+	  	long long expected = 0;
+	  	#pragma omp parallel for reduction(+:expected)
+	  	for (long long i = 0; i < C_length; i++)
 	  	{
-	  	  case PRED_LT:  match = (V[i] <  c1); break;
-	  	  case PRED_LE:  match = (V[i] <= c1); break;
-	  	  case PRED_GT:  match = (V[i] >  c1); break;
-	  	  case PRED_GE:  match = (V[i] >= c1); break;
-	  	  case PRED_EQ:  match = (V[i] == c1); break;
-	  	  case PRED_NEQ: match = (V[i] != c1); break;
-	  	  default:       match = (V[i] > c1 && V[i] < c2); break;
+	  	  uint32_t v = value_at(i, mask);
+	  	  bool match;
+	  	  switch (pred)
+	  	  {
+	  	    case PRED_LT:  match = (v <  c1); break;
+	  	    case PRED_LE:  match = (v <= c1); break;
+	  	    case PRED_GT:  match = (v >  c1); break;
+	  	    case PRED_GE:  match = (v >= c1); break;
+	  	    case PRED_EQ:  match = (v == c1); break;
+	  	    case PRED_NEQ: match = (v != c1); break;
+	  	    default:       match = (v > c1 && v < c2); break;
+	  	  }
+	  	  if (match) expected++;
 	  	}
-	  	if (match) expected++;
-	  }
-	  if (expected != matches)
-	  {
-	  	printf("VERIFICATION FAILED: scalar scan found %lld matching rows\n", expected);
+	  	if (expected != matches)
+	  	{
+	  	  printf("VERIFICATION FAILED: scalar scan found %lld matching rows\n", expected);
+	  	}
 	  }
   }
   printf("*****Summary: **************************************************************************************\n");
-  printf("%d Rows of data, each data represented by %d bits.\n", C_length, B);
+  printf("%lld Rows of data, each data represented by %d bits.\n", C_length, B);
   printf("Predicate: %s, %d OpenMP thread(s).\n", pred_name(pred), active_threads);
   cout << "Repeated for " << loop_num << " times. " << endl;
   cout << "Average Time: " << double(total_time / loop_num) << " s (scan kernel only)" << endl;
@@ -558,7 +594,6 @@ int main (int argc, char **argv)
   }
 
   for (int bit = 0; bit < B; bit++) free(W[bit]);
-  free(V);
   return EXIT_SUCCESS;
 }
 
